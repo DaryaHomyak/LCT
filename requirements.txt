@@ -1,0 +1,36 @@
+# Основные зависимости веб-сервиса
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+aiofiles==23.2.1
+jinja2==3.1.2
+
+# База данных
+sqlalchemy==2.0.23
+alembic==1.12.1
+
+# Обработка файлов
+pillow==10.1.0
+pdf2image==1.16.3
+python-magic-bin==0.4.14  # для Windows
+
+# OCR и обработка изображений  
+opencv-python==4.8.1.78
+numpy==1.26.4
+pytesseract==0.3.10
+paddlepaddle==3.0.0
+paddleocr==2.8.1
+easyocr==1.7.0
+
+# ИИ постобработка
+requests==2.31.0
+
+# Утилиты
+python-dotenv==1.0.0
+pydantic==2.5.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# Экспорт данных
+openpyxl==3.1.2
+pandas==2.1.4

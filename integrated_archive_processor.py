@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Интегрированная система обработки архивных документов
-Объединяет сегментацию, OCR и постобработку в единый пайплайн
+Упрощенная система обработки архивных документов
+Только PaddleOCR + сегментация по вертикальным/горизонтальным линиям
 
 Компоненты:
-1. Сегментация изображений (из Prep_for_recognition.ipynb)
-2. OCR распознавание (Tesseract, PaddleOCR, EasyOCR)
-3. Постобработка через YandexGPT (из Lidery_tsifrovoi_transformatsii)
+1. Детекция линий разметки (вертикальные/горизонтальные)
+2. Сегментация на ячейки по координатам линий
+3. OCR только через PaddleOCR (без Tesseract/EasyOCR)
+4. Постобработка через YandexGPT (опционально)
 
 Дата: 2025
 """
@@ -16,7 +17,6 @@ import os
 import sys
 import cv2
 import json
-import math
 import time
 import numpy as np
 import logging
@@ -25,6 +25,7 @@ from typing import List, Dict, Tuple, Optional
 from PIL import Image
 import requests
 from dotenv import load_dotenv
+
 
 load_dotenv()  # загрузит .env в os.environ
 
@@ -40,14 +41,12 @@ logger = logging.getLogger(__name__)
 
 class DocumentSegmentator:
     """
-    Класс для предобработки и сегментации архивных документов
+    Класс для сегментации архивных документов по линиям разметки
     """
 
     def __init__(self):
-        self.binary_image = None
         self.original_image = None
         self.debug_images = {}
-        self.last_rotation = 0
 
     def load_image(self, image_path: str) -> np.ndarray:
         """Загружает изображение и возвращает серое изображение"""
@@ -61,414 +60,195 @@ class DocumentSegmentator:
         self.debug_images['gray'] = gray.copy()
         return gray
 
-    def preprocess(self, gray: np.ndarray) -> np.ndarray:
+    def detect_lines(self, gray: np.ndarray) -> Tuple[List[int], List[int]]:
         """
-        Предобработка изображения: контраст и бинаризация (для Tesseract)
-        Для PaddleOCR будет использоваться исходный RGB без этой бинаризации.
+        Детекция вертикальных и горизонтальных линий разметки
+        Возвращает координаты линий для сегментации
         """
-        logger.info("Выполняем предобработку изображения")
+        logger.info("Детектируем линии разметки")
 
         # Улучшение контраста
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray_eq = clahe.apply(gray)
+        enhanced = cv2.GaussianBlur(clahe.apply(gray), (3, 3), 0)
 
-        # Адаптивная бинаризация (инверт: текст белый)
-        bin_inv = cv2.adaptiveThreshold(
-            gray_eq, 255,
+        # Бинаризация
+        binary = cv2.adaptiveThreshold(
+            enhanced, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV,
-            41, 12
+            15, 10
         )
 
-        # Легкая дилатация по вертикали
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2))
-        bin_inv = cv2.dilate(bin_inv, kernel, iterations=1)
+        # Детекция вертикальных линий
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, gray.shape[0]//30))
+        vertical_mask = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
 
-        # Нормализуем в {0,255}
-        bin_inv = (bin_inv > 0).astype(np.uint8) * 255
+        # Детекция горизонтальных линий
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (gray.shape[1]//30, 1))
+        horizontal_mask = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
 
-        self.binary_image = bin_inv
-        self.debug_images['binary_inverted'] = bin_inv.copy()
-        return bin_inv
+        # Объединяем маски линий
+        lines_mask = cv2.bitwise_or(vertical_mask, horizontal_mask)
+        self.debug_images['lines_mask'] = lines_mask.copy()
 
-    def _strip_margins(self, binary_img: np.ndarray) -> Tuple[np.ndarray, int, int]:
-        """Обрезает пустые поля сверху и снизу"""
-        hproj = cv2.reduce(binary_img, 1, cv2.REDUCE_SUM, dtype=cv2.CV_32F).ravel()
-        hproj_smooth = cv2.GaussianBlur(hproj, (0, 0), 5)
+        # Находим координаты вертикальных линий
+        vertical_coords = []
+        v_projection = np.sum(vertical_mask, axis=0)
+        v_threshold = np.max(v_projection) * 0.3
+        for x in range(len(v_projection)):
+            if v_projection[x] > v_threshold:
+                vertical_coords.append(x)
 
-        if len(hproj_smooth) == 0 or np.max(hproj_smooth) == 0:
-            return binary_img, 0, binary_img.shape[0]
+        # Группируем близкие линии и берем средние координаты
+        vertical_lines = self._group_coordinates(vertical_coords, min_distance=20)
 
-        threshold = 0.05 * np.max(hproj_smooth)
+        # Находим координаты горизонтальных линий
+        horizontal_coords = []
+        h_projection = np.sum(horizontal_mask, axis=1)
+        h_threshold = np.max(h_projection) * 0.3
+        for y in range(len(h_projection)):
+            if h_projection[y] > h_threshold:
+                horizontal_coords.append(y)
 
-        # Поиск верхней границы
-        top = 0
-        for i, val in enumerate(hproj_smooth):
-            if val > threshold:
-                top = i
-                break
+        # Группируем близкие линии
+        horizontal_lines = self._group_coordinates(horizontal_coords, min_distance=20)
 
-        # Поиск нижней границы
-        bottom = len(hproj_smooth)
-        for i in range(len(hproj_smooth) - 1, -1, -1):
-            if hproj_smooth[i] > threshold:
-                bottom = i + 1
-                break
+        logger.info(f"Найдено вертикальных линий: {len(vertical_lines)}")
+        logger.info(f"Найдено горизонтальных линий: {len(horizontal_lines)}")
 
-        if bottom <= top:
-            return binary_img, 0, binary_img.shape[0]
+        return vertical_lines, horizontal_lines
 
-        return binary_img[top:bottom, :], top, bottom
+    def _group_coordinates(self, coords: List[int], min_distance: int = 20) -> List[int]:
+        """Группирует близкие координаты и возвращает средние значения"""
+        if not coords:
+            return []
 
-    def segment_columns(self, binary_img: np.ndarray) -> List[np.ndarray]:
+        coords = sorted(set(coords))  # убираем дубли и сортируем
+        groups = []
+        current_group = [coords[0]]
+
+        for i in range(1, len(coords)):
+            if coords[i] - coords[i-1] <= min_distance:
+                current_group.append(coords[i])
+            else:
+                groups.append(current_group)
+                current_group = [coords[i]]
+        groups.append(current_group)
+
+        # Возвращаем средние координаты групп
+        return [int(np.mean(group)) for group in groups]
+
+    def segment_by_lines(self, vertical_lines: List[int], horizontal_lines: List[int]) -> List[np.ndarray]:
         """
-        Сегментация изображения на колонки текста (для Tesseract-пайплайна)
+        Сегментация изображения на ячейки по координатам линий
         """
-        logger.info("Выполняем сегментацию на колонки")
+        logger.info("Выполняем сегментацию по линиям")
 
-        # Убираем поля
-        cropped, top, bottom = self._strip_margins(binary_img)
-        if cropped.size == 0:
-            return [binary_img]
+        if not self.original_image.any():
+            return []
 
-        # Вертикальная проекция
-        vproj = cv2.reduce(cropped, 0, cv2.REDUCE_SUM, dtype=cv2.CV_32F).ravel()
-        vproj_smooth = cv2.GaussianBlur(vproj.astype(np.float32), (0, 0), 3)
-
-        if np.max(vproj_smooth) > 0:
-            vproj_norm = vproj_smooth / np.max(vproj_smooth)
-        else:
-            return [cropped]
-
-        # Поиск промежутков между колонками
-        threshold = 0.1
-        gaps = vproj_norm < threshold
+        # Добавляем границы изображения как линии
+        height, width = self.original_image.shape[:2]
+        v_coords = sorted([0] + vertical_lines + [width])
+        h_coords = sorted([0] + horizontal_lines + [height])
 
         segments = []
-        start = 0
-        in_gap = False
-        min_segment_width = 50
+        segment_id = 0
 
-        for i, is_gap in enumerate(gaps):
-            if is_gap and not in_gap:
-                if i - start > min_segment_width:
-                    segment = cropped[:, start:i]
-                    if segment.shape[1] > 0:
+        # Создаем сегменты по пересечениям линий
+        for i in range(len(h_coords) - 1):
+            for j in range(len(v_coords) - 1):
+                y1, y2 = h_coords[i], h_coords[i + 1]
+                x1, x2 = v_coords[j], v_coords[j + 1]
+
+                # Проверяем размер сегмента (исключаем слишком маленькие)
+                if (y2 - y1) > 30 and (x2 - x1) > 30:
+                    segment = self.original_image[y1:y2, x1:x2]
+                    if segment.size > 0:
                         segments.append(segment)
-                in_gap = True
-            elif not is_gap and in_gap:
-                start = i
-                in_gap = False
+                        segment_id += 1
 
-        # Последний сегмент
-        if not in_gap and len(vproj_norm) - start > min_segment_width:
-            segment = cropped[:, start:]
-            if segment.shape[1] > 0:
-                segments.append(segment)
+                        # Сохраняем координаты сегмента для отладки
+                        self.debug_images[f'segment_{segment_id}'] = {
+                            'image': segment,
+                            'bbox': (x1, y1, x2, y2)
+                        }
 
-        if not segments:
-            segments = [cropped]
-
-        logger.info(f"Найдено сегментов: {len(segments)}")
+        logger.info(f"Создано сегментов: {len(segments)}")
         return segments
+
+    def process_segmentation(self, gray: np.ndarray) -> List[np.ndarray]:
+        """Полный процесс сегментации: детекция линий + разделение на сегменты"""
+        vertical_lines, horizontal_lines = self.detect_lines(gray)
+        return self.segment_by_lines(vertical_lines, horizontal_lines)
 
 
 class OCREngine:
     """
-    Класс для распознавания текста различными OCR движками
+    Упрощенный OCR движок - только PaddleOCR
     """
 
-    def __init__(self, engine: str = 'tesseract', lang: str = 'rus'):
-        self.engine = engine.lower()
+    def __init__(self, lang: str = 'ru'):
         self.lang = lang
-        self._setup_engine()
-
-    def _setup_engine(self):
-        """Инициализация выбранного OCR движка"""
-        logger.info(f"Настраиваем OCR движок: {self.engine}")
-
-        if self.engine == 'tesseract':
-            self._setup_tesseract()
-        elif self.engine == 'paddle':
-            self._setup_paddle()
-        elif self.engine == 'easy':
-            self._setup_easy()
-        else:
-            raise ValueError(f"Неподдерживаемый OCR движок: {self.engine}")
-
-    # -------------------- Tesseract --------------------
-
-    def _setup_tesseract(self):
-        """Настройка Tesseract OCR для дореволюционной орфографии"""
-        try:
-            import pytesseract
-            self.tesseract = pytesseract
-
-            old_cyrillic = 'ѣѳiѵѢѲIѴ'
-            modern_cyrillic = 'абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'
-            digits_punct = '0123456789.,;:!?()[]\\"\' '
-
-            whitelist = modern_cyrillic + old_cyrillic + digits_punct
-            self.tesseract_config = f'--oem 3 --psm 6 -c tessedit_char_whitelist={whitelist}'
-
-            logger.info("Tesseract настроен для дореволюционной орфографии")
-        except ImportError:
-            logger.error("Tesseract не установлен. Установите: pip install pytesseract")
-            raise
-
-    def _preprocess_for_tesseract(self, image: np.ndarray) -> np.ndarray:
-        """Дополнительная предобработка для Tesseract"""
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        denoised = cv2.medianBlur(enhanced, 3)
-
-        # Масштабирование
-        scale_factor = 2.0
-        height, width = denoised.shape
-        scaled = cv2.resize(
-            denoised,
-            (int(width * scale_factor), int(height * scale_factor)),
-            interpolation=cv2.INTER_CUBIC
-        )
-
-        # Инверсия: текст должен быть черным на белом
-        if np.mean(scaled) < 128:
-            scaled = cv2.bitwise_not(scaled)
-
-        return scaled
-
-    def _tesseract_recognize(self, image_segment: np.ndarray) -> str:
-        processed = self._preprocess_for_tesseract(image_segment)
-        pil_image = Image.fromarray(processed)
-        text = self.tesseract.image_to_string(
-            pil_image,
-            lang=self.lang,
-            config=self.tesseract_config
-        )
-        return text.strip()
-
-    # -------------------- PaddleOCR 3.x --------------------
+        self._setup_paddle()
 
     def _setup_paddle(self):
-        """Настройка PaddleOCR 3.x (без устаревших аргументов)"""
+        """Настройка PaddleOCR с оптимизированными параметрами"""
         try:
             from paddleocr import PaddleOCR
-            # Никаких show_log / use_gpu — API 3.x
-            # Выбор CPU/GPU делает сам PaddlePaddle по установленному бэкенду
+
+            # Без поворота текста, оптимизированные пороги для детекции
             self.paddle_ocr = PaddleOCR(
-                use_angle_cls=True,  # общая ориентация текстовых строк/страницы
-                lang='ru'
+                use_angle_cls=False,  # Убираем определение ориентации
+                lang=self.lang,
+                det_db_thresh=0.2,        # Понижаем порог детекции
+                det_db_box_thresh=0.3,    # Порог фильтрации боксов
+                det_db_unclip_ratio=2.2,  # Расширение контуров
+                max_side_len=4096         # Максимальный размер стороны
             )
-            logger.info("PaddleOCR настроен (3.x)")
+            logger.info("PaddleOCR настроен (без поворота текста)")
         except ImportError:
             logger.error("PaddleOCR не установлен. Установите: pip install paddleocr")
             raise
 
-    def _order_paddle_result_by_columns(self, result, n_cols: Optional[int] = None) -> str:
-        """
-        Робастная сборка результата PaddleOCR 3.x:
-        - Поддерживает bbox как 4 пары точек, как 8 чисел, и как dict с 'points'/'bbox'
-        - Безопасно читает (text, score), dict{'text','score'} и строку
-        - Группирует по колонкам и сортирует строки сверху-вниз
-        """
-
-        def _extract_box(det0):
-            if det0 is None:
-                return None
-            # 4 пары точек
-            if isinstance(det0, (list, tuple)) and len(det0) == 4 and all(
-                    isinstance(p, (list, tuple)) and len(p) == 2 for p in det0):
-                return [(float(p[0]), float(p[1])) for p in det0]
-            # 8 чисел
-            if isinstance(det0, (list, tuple)) and len(det0) == 8 and all(isinstance(v, (int, float)) for v in det0):
-                xs = list(map(float, det0))
-                return [(xs[0], xs[1]), (xs[2], xs[3]), (xs[4], xs[5]), (xs[6], xs[7])]
-            # dict с points/bbox
-            if isinstance(det0, dict):
-                if 'points' in det0 and isinstance(det0['points'], (list, tuple)) and len(det0['points']) >= 4:
-                    pts = det0['points']
-                    return [(float(pts[0][0]), float(pts[0][1])),
-                            (float(pts[1][0]), float(pts[1][1])),
-                            (float(pts[2][0]), float(pts[2][1])),
-                            (float(pts[3][0]), float(pts[3][1]))]
-                if 'bbox' in det0 and isinstance(det0['bbox'], (list, tuple)) and len(det0['bbox']) == 4:
-                    x, y, w, h = map(float, det0['bbox'])
-                    return [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-            return None
-
-        def _extract_text_score(det1):
-            # (text, score)
-            if det1 is None:
-                return "", 0.0
-            if isinstance(det1, (list, tuple)) and len(det1) >= 1:
-                text = det1[0] if isinstance(det1[0], str) else ""
-                score = float(det1[1]) if len(det1) > 1 and isinstance(det1[1], (int, float)) else 0.0
-                return text, score
-            # dict
-            if isinstance(det1, dict):
-                text = det1.get('text', "")
-                score = float(det1.get('score', 0.0))
-                return text if isinstance(text, str) else "", score
-            # строка
-            if isinstance(det1, str):
-                return det1, 0.0
-            return "", 0.0
-
-        # Уплощаем возможную вложенность [[...]]
-        rows = result
-        if not rows:
-            return ""
-        if isinstance(rows, (list, tuple)) and len(rows) == 1 and isinstance(rows[0], (list, tuple)):
-            rows = rows[0]
-
-        items = []
-        for det in rows:
-            det0 = det[0] if isinstance(det, (list, tuple)) and len(det) >= 1 else (
-                det.get('box') if isinstance(det, dict) else None)
-            # ВАЖНО: не берём det[0] у dict, чтобы не ловить KeyError(0)
-            det1 = det[1] if isinstance(det, (list, tuple)) and len(det) >= 2 else (
-                det if isinstance(det, dict) else None)
-
-            box = _extract_box(det0)
-            text, score = _extract_text_score(det1)
-            if not box or not text:
-                continue
-
-            x1, y1 = box[0];
-            x2, _ = box[1];
-            x3, y3 = box[2]
-            xc = (x1 + x2 + x3) / 3.0
-            yc = (y1 + y3) / 2.0
-            items.append((xc, yc, text, score))
-
-        if not items:
-            return ""
-
-        xs = sorted([it[0] for it in items])
-        diffs = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
-        if n_cols is None:
-            if diffs:
-                med = float(np.median(diffs))
-                thr = max(40.0, 3.0 * med)
-                n_cols = min(max(len([d for d in diffs if d > thr]) + 1, 2), 12)
-            else:
-                n_cols = 7
-
-        # Если все центры почти совпадают по X, ставим хотя бы 2 колонки
-        if n_cols < 2:
-            n_cols = 2
-
-        edges = np.linspace(min(xs), max(xs) + 1e-6, n_cols + 1)
-        cols: List[List[Tuple[float, str]]] = [[] for _ in range(n_cols)]
-        for xc, yc, text, _ in items:
-            # Защита от левого попадания в бин
-            idx = int(np.searchsorted(edges, xc) - 1)
-            if idx < 0:
-                idx = 0
-            if idx >= n_cols:
-                idx = n_cols - 1
-            cols[idx].append((yc, text))
-
-        ordered: List[str] = []
-        for col in cols:
-            col.sort(key=lambda t: t[0])
-            ordered.extend([t for _, t in col])
-
-        return "\n".join(ordered).strip()
-
-    def _paddle_recognize(self, image_segment: np.ndarray) -> str:
-        """
-        PaddleOCR 3.x: подаём RGB и используем устойчивую сборку колонок.
-        """
-        if len(image_segment.shape) == 2:
-            rgb_image = cv2.cvtColor(image_segment, cv2.COLOR_GRAY2RGB)
-        else:
-            rgb_image = cv2.cvtColor(image_segment, cv2.COLOR_BGR2RGB)
-
-        result = self.paddle_ocr.ocr(rgb_image)  # API 3.x без cls
-        try:
-            # При желании можно жестко задать n_cols=7 для метрической книги:
-            # text = self._order_paddle_result_by_columns(result, n_cols=7)
-            text = self._order_paddle_result_by_columns(result, n_cols=None)
-        except Exception as e:
-            logger.error(f"Сборка колонок не удалась: {e}")
-            # Фолбэк: плоская склейка строк
-            lines = []
-            rows = result
-            if isinstance(rows, (list, tuple)) and len(rows) == 1 and isinstance(rows[0], (list, tuple)):
-                rows = rows[0]
-            for det in rows or []:
-                try:
-                    # Ожидаем det[1] = (text, score) или dict
-                    if isinstance(det, (list, tuple)) and len(det) >= 2 and isinstance(det[1], (list, tuple)) and det[
-                        1]:
-                        if isinstance(det[1][0], str):
-                            lines.append(det[1][0])
-                    elif isinstance(det, dict) and isinstance(det.get('text'), str):
-                        lines.append(det['text'])
-                except Exception:
-                    continue
-            text = "\n".join(lines).strip()
-        return text
-
-    # -------------------- EasyOCR --------------------
-
-    def _setup_easy(self):
-        """Настройка EasyOCR"""
-        try:
-            import easyocr
-            self.easy_reader = easyocr.Reader(['ru'], gpu=False, verbose=False)
-            logger.info("EasyOCR настроен")
-        except ImportError:
-            logger.error("EasyOCR не установлен. Установите: pip install easyocr")
-            raise
-
-    def _easy_recognize(self, image_segment: np.ndarray) -> str:
-        if len(image_segment.shape) == 2:
-            image_array = cv2.cvtColor(image_segment, cv2.COLOR_GRAY2BGR)
-        else:
-            image_array = image_segment
-
-        results = self.easy_reader.readtext(image_array)
-        parts = []
-        for item in results:
-            if len(item) >= 3:
-                _, text, conf = item[0], item[1], item[2]
-                if conf > 0.5 and text:
-                    parts.append(text)
-        return "\n".join(parts).strip()
-
-    # -------------------- Public --------------------
-
     def recognize_text(self, image_segment: np.ndarray) -> str:
-        """Распознавание текста в сегменте изображения"""
+        """Распознавание текста в сегменте"""
         try:
-            if self.engine == 'tesseract':
-                return self._tesseract_recognize(image_segment)
-            elif self.engine == 'paddle':
-                return self._paddle_recognize(image_segment)
-            elif self.engine == 'easy':
-                return self._easy_recognize(image_segment)
+            # Конвертируем в RGB для PaddleOCR
+            if len(image_segment.shape) == 2:
+                rgb_image = cv2.cvtColor(image_segment, cv2.COLOR_GRAY2RGB)
+            else:
+                rgb_image = cv2.cvtColor(image_segment, cv2.COLOR_BGR2RGB)
+
+            # OCR распознавание
+            result = self.paddle_ocr.ocr(rgb_image)
+
+            # Извлекаем текст из результата
+            text_lines = []
+            if result and result[0]:
+                for detection in result[0]:
+                    if len(detection) >= 2 and detection[1]:
+                        text = detection[1][0] if isinstance(detection[1][0], str) else ""
+                        if text.strip():
+                            text_lines.append(text)
+
+            return "\n".join(text_lines)
+
         except Exception as e:
-            logger.error(f"Ошибка распознавания ({self.engine}): {e}")
+            logger.error(f"Ошибка распознавания: {e}")
             return ""
 
 
 class YandexGPTProcessor:
     """
-    Класс для постобработки распознанного текста через YandexGPT
+    Постобработка текста через YandexGPT с сохранением дореволюционной орфографии
     """
 
     def __init__(self, api_key: Optional[str] = None, folder_id: Optional[str] = None):
-        self.api_key = api_key or os.getenv('YANDEX_API_KEY') or "TEST_API_KEY_PLACEHOLDER"
-        self.folder_id = folder_id or os.getenv('YANDEX_FOLDER_ID') or "TEST_FOLDER_ID_PLACEHOLDER"
+        self.api_key = api_key or os.getenv('YANDEX_API_KEY')
+        self.folder_id = folder_id or os.getenv('YANDEX_FOLDER_ID')
 
-        if (self.api_key == "TEST_API_KEY_PLACEHOLDER") or (self.folder_id == "TEST_FOLDER_ID_PLACEHOLDER"):
+        if not self.api_key or not self.folder_id:
             logger.warning("YandexGPT API ключи не настроены. Используется заглушка.")
             self.use_mock = True
         else:
@@ -505,7 +285,7 @@ class YandexGPTProcessor:
 РЕЗУЛЬТАТ (только исправленный текст без комментариев):"""
 
     def _mock_processing(self, text: str) -> str:
-        # Лёгкая псевдокоррекция для демонстрации
+        """Простая заглушка для демонстрации"""
         replacements = {
             'дело': 'дѣло',
             'место': 'мѣсто',
@@ -519,6 +299,7 @@ class YandexGPTProcessor:
         return out
 
     def _yandex_gpt_processing(self, text: str) -> str:
+        """Обработка через YandexGPT API"""
         prompt = f"{self.system_prompt}\n\nТЕКСТ ДЛЯ ОБРАБОТКИ:\n{text}\n\nРЕЗУЛЬТАТ:"
         data = {
             "modelUri": f"gpt://{self.folder_id}/yandexgpt",
@@ -537,8 +318,10 @@ class YandexGPTProcessor:
             return text
 
     def process_text(self, text_to_correct: str) -> str:
+        """Обработка текста с исправлением ошибок OCR"""
         if not text_to_correct.strip():
             return ""
+
         if self.use_mock:
             return self._mock_processing(text_to_correct)
         return self._yandex_gpt_processing(text_to_correct)
@@ -546,20 +329,18 @@ class YandexGPTProcessor:
 
 class ArchiveDocumentProcessor:
     """
-    Главный класс для обработки архивных документов
-    Интегрирует все компоненты системы
+    Упрощенный процессор архивных документов
     """
 
     def __init__(self,
-                 ocr_engine: str = 'tesseract',
                  use_postprocessing: bool = True,
                  yandex_api_key: Optional[str] = None,
                  yandex_folder_id: Optional[str] = None):
 
-        logger.info("Инициализация системы обработки архивных документов")
+        logger.info("Инициализация упрощенной системы обработки архивных документов")
 
         self.segmentator = DocumentSegmentator()
-        self.ocr_engine = OCREngine(engine=ocr_engine)
+        self.ocr_engine = OCREngine()
 
         self.use_postprocessing = use_postprocessing
         self.text_processor: Optional[YandexGPTProcessor] = None
@@ -569,68 +350,80 @@ class ArchiveDocumentProcessor:
                 folder_id=yandex_folder_id
             )
 
-        logger.info(f"Система готова. OCR: {ocr_engine}, Постобработка: {use_postprocessing}")
+        logger.info(f"Система готова. OCR: PaddleOCR, Постобработка: {use_postprocessing}")
 
     def _estimate_text_quality(self, text: str) -> float:
-        """Простая оценка доли кириллицы (включая дореволюционные символы)"""
+        """Оценка качества распознанного текста"""
         if not text:
             return 0.0
+
         cyr = set('абвгдеёжзийклмнопрстуфхцчшщъыьэюя')
         old = set('ѣѳiѵ')
         letters = [c for c in text.lower() if c.isalpha()]
+
         if not letters:
             return 0.0
+
         good = sum(1 for c in letters if c in cyr or c in old)
         return min(1.0, good / len(letters))
 
     def _save_segment_image(self, segment: np.ndarray, output_dir: str, segment_id: int):
+        """Сохранение изображения сегмента"""
         os.makedirs(output_dir, exist_ok=True)
-        # Для визуализации делаем текст чёрным на белом
-        img = segment
-        if len(img.shape) == 2:
-            display = cv2.bitwise_not(img)
-        else:
-            # в цвете инверсию не делаем
-            display = img.copy()
         path = os.path.join(output_dir, f"segment_{segment_id:02d}.png")
-        cv2.imwrite(path, display)
+        cv2.imwrite(path, segment)
+
+    def _save_debug_images(self, output_dir: str):
+        """Сохранение отладочных изображений"""
+        debug_dir = os.path.join(output_dir, 'debug')
+        os.makedirs(debug_dir, exist_ok=True)
+
+        for name, image in self.segmentator.debug_images.items():
+            if isinstance(image, dict):  # Сегменты с bbox
+                cv2.imwrite(os.path.join(debug_dir, f"{name}.png"), image['image'])
+            else:
+                cv2.imwrite(os.path.join(debug_dir, f"{name}.png"), image)
+
+        logger.info(f"Отладочные изображения сохранены в: {debug_dir}")
 
     def process_document(self, image_path: str, output_dir: Optional[str] = None) -> List[Dict]:
         """
-        Полный цикл обработки документа:
-        - Загрузка и предобработка
-        - Для Paddle: распознаём полную RGB-страницу без бинаризации/сегментации
-        - Для Tesseract/Easy: сегментируем колонки по бинарной маске
-        - Постобработка через YandexGPT (опционально)
+        Полный процесс обработки документа:
+        1. Загрузка изображения
+        2. Детекция линий разметки
+        3. Сегментация по линиям на ячейки
+        4. OCR каждой ячейки
+        5. Постобработка через YandexGPT (опционально)
         """
         logger.info(f"Начинаем обработку документа: {image_path}")
 
-        # 1) Загрузка и предобработка
+        # Загрузка изображения
         gray = self.segmentator.load_image(image_path)
-        binary = self.segmentator.preprocess(gray)
 
-        results: List[Dict] = []
+        # Сегментация по линиям
+        segments = self.segmentator.process_segmentation(gray)
 
-        # 2) Ветвление пайплайна
-        if self.ocr_engine.engine == 'paddle':
-            # Подаём полную страницу в RGB без сегментации
+        if not segments:
+            logger.warning("Сегменты не найдены. Обрабатываем как единое изображение.")
             segments = [self.segmentator.original_image]
-        else:
-            # Сегментация колонок по бинарной маске
-            segments = self.segmentator.segment_columns(binary)
 
-        # 3) OCR + постобработка
+        results = []
+
+        # Обработка каждого сегмента
         for i, segment in enumerate(segments):
             logger.info(f"Обрабатываем сегмент {i + 1}/{len(segments)}")
 
+            # OCR распознавание
             raw_text = self.ocr_engine.recognize_text(segment)
             logger.info(f"OCR результат: {raw_text[:100]}...")
 
+            # Постобработка
             if self.use_postprocessing and raw_text.strip():
                 cleaned_text = self.text_processor.process_text(raw_text) if self.text_processor else raw_text
             else:
                 cleaned_text = raw_text
 
+            # Формируем результат
             item = {
                 'segment_id': i + 1,
                 'raw_text': raw_text,
@@ -640,19 +433,24 @@ class ArchiveDocumentProcessor:
             }
             results.append(item)
 
+            # Сохраняем сегмент
             if output_dir:
                 self._save_segment_image(segment, output_dir, i + 1)
+
+        # Сохраняем отладочные изображения
+        if output_dir:
+            self._save_debug_images(output_dir)
 
         logger.info(f"Обработка завершена. Обработано сегментов: {len(results)}")
         return results
 
     def save_results(self, results: List[Dict], output_path: str):
-        """Сохраняет результаты распознавания в текстовый файл (безопасно обрабатывает пустой каталог)"""
+        """Сохранение результатов распознавания в текстовый файл"""
         logger.info(f"Сохраняем результаты в: {output_path}")
 
         dir_name = os.path.dirname(output_path)
         if not dir_name:
-            dir_name = os.getcwd()  # текущая директория по умолчанию
+            dir_name = os.getcwd()
         os.makedirs(dir_name, exist_ok=True)
 
         full_path = output_path if os.path.isabs(output_path) else os.path.join(dir_name, os.path.basename(output_path))
@@ -677,12 +475,10 @@ class ArchiveDocumentProcessor:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Система обработки архивных документов с дореволюционной орфографией'
+        description='Упрощенная система обработки архивных документов (только PaddleOCR + сегментация по линиям)'
     )
     parser.add_argument('input_image', help='Путь к изображению документа')
     parser.add_argument('--output-dir', default='output', help='Директория для выходных файлов')
-    parser.add_argument('--ocr-engine', choices=['tesseract', 'paddle', 'easy'],
-                        default='tesseract', help='OCR движок')
     parser.add_argument('--no-postprocessing', action='store_true',
                         help='Отключить постобработку через YandexGPT')
     parser.add_argument('--yandex-api-key', help='API ключ YandexGPT')
@@ -698,15 +494,8 @@ def main():
         logger.error(f"Файл не найден: {args.input_image}")
         return 1
 
-    # Временный локальный fallback (можно удалить перед продом)
-    os.environ.setdefault("YANDEX_API_KEY",
-                          args.yandex_api_key or os.getenv("YANDEX_API_KEY", "TEST_API_KEY_PLACEHOLDER"))
-    os.environ.setdefault("YANDEX_FOLDER_ID",
-                          args.yandex_folder_id or os.getenv("YANDEX_FOLDER_ID", "TEST_FOLDER_ID_PLACEHOLDER"))
-
     try:
         processor = ArchiveDocumentProcessor(
-            ocr_engine=args.ocr_engine,
             use_postprocessing=not args.no_postprocessing,
             yandex_api_key=args.yandex_api_key,
             yandex_folder_id=args.yandex_folder_id
@@ -714,14 +503,13 @@ def main():
 
         results = processor.process_document(args.input_image, args.output_dir)
 
-        # Если пользователь передал только имя файла — сохранится в текущую директорию
-        results_file = os.path.join(args.output_dir, 'results.txt') if args.output_dir else 'results.txt'
+        # Сохранение результатов
+        results_file = os.path.join(args.output_dir, 'results.txt')
         processor.save_results(results, results_file)
 
         print("\nОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО!")
         print(f"Результаты сохранены в: {results_file}")
-        if args.output_dir:
-            print(f"Сегменты сохранены в: {args.output_dir}")
+        print(f"Сегменты сохранены в: {args.output_dir}")
 
         return 0
 
