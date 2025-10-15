@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-ИСПРАВЛЕННЫЙ интегрированный архивный процессор
-Версия с angle classifier, улучшенной детекцией и двумя перцентилями
-"""
-
 import re
 import cv2
 import numpy as np
